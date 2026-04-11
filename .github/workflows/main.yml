@@ -1,0 +1,44 @@
+name: DHHF Ultimate Bot
+
+on:
+  schedule:
+    - cron: '*/15 0-6 * * 1-5'
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+
+env:
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  AVERAGE_COST: ${{ secrets.AVERAGE_COST }}
+  MONTHLY_AMOUNT: ${{ secrets.MONTHLY_AMOUNT }}
+  BONUS_AMOUNT: ${{ secrets.BONUS_AMOUNT }}
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download state
+      uses: actions/download-artifact@v4
+      with:
+        name: bot-state
+        path: .
+      continue-on-error: true
+    
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install packages
+      run: pip install python-telegram-bot yfinance pandas numpy
+    
+    - name: Run bot
+      run: python bot.py
+    
+    - name: Save state
+      uses: actions/upload-artifact@v4
+      with:
+        name: bot-state
+        path: bot_state.json
+        retention-days: 90
