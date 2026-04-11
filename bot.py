@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DHHF Ultimate Bot v3.0 - Smart DCA with Buy Signals"""
+"""DHHF Ultimate Bot v3.1 - TEST MODE (always sends message)"""
 
 import os
 import json
@@ -130,17 +130,44 @@ class DHHFBot:
             return "⏳ WEAK", False, "Don't buy - too expensive"
     
     async def send(self, msg):
+        """Send Telegram message with error logging"""
         try:
             bot = Bot(token=TOKEN)
             await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
+            logger.info(f"✅ Message sent successfully to {CHAT_ID}")
             return True
         except Exception as e:
-            logger.error(f"Telegram error: {e}")
+            logger.error(f"❌ Telegram send failed: {e}")
+            logger.error(f"Token: {TOKEN[:10]}... Chat ID: {CHAT_ID}")
             return False
     
     async def run(self):
+        """Main bot logic - ALWAYS sends test message first"""
+        
+        # TEST MESSAGE (always sent)
+        now = datetime.now()
+        test_msg = f"""🧪 *BOT TEST MESSAGE*
+
+If you see this, your bot is working! ✅
+
+Time: {now.strftime('%Y-%m-%d %H:%M:%S')}
+Chat ID: {CHAT_ID}
+
+Now fetching DHHF data..."""
+        
+        test_sent = await self.send(test_msg)
+        if not test_sent:
+            logger.error("❌ Failed to send test message - check your Telegram token and chat ID")
+            return
+        
+        await asyncio.sleep(2)
+        
+        # FETCH DATA
         data = self.fetch_data()
+        
         if not data or not data['price']:
+            error_msg = "❌ *ERROR*\n\nFailed to fetch DHHF data. Will retry in 15 minutes."
+            await self.send(error_msg)
             return
         
         price = data['price']
@@ -149,7 +176,30 @@ class DHHFBot:
         
         logger.info(f"Price: ${price:.2f} | Score: {score}/100")
         
-        now = datetime.now()
+        # MAIN ANALYSIS MESSAGE (always sent)
+        main_msg = f"""📊 *DHHF ANALYSIS*
+
+💰 Price: `${price:.2f}` ({data['change']:+.1f}% today)
+🎯 Score: {score}/100 - {urgency}
+
+📈 Market Context:
+• 52w Range: ${data['low_52w']:.2f} - ${data['high_52w']:.2f}
+• From High: `{((data['high_52w']-price)/data['high_52w']*100):.1f}%` discount
+• Historical: {percentile:.0f}th percentile
+• 50d MA: ${data['avg_50d']:.2f} | 200d MA: ${data['avg_200d']:.2f}
+
+💼 Your Position:
+• Your Avg Cost: ${AVG_COST:.2f}
+• vs Your Cost: `{your_disc:+.1f}%`
+• P&L: `{((price-AVG_COST)/AVG_COST*100):+.1f}%`
+
+💡 Recommendation: {action}
+
+⏰ {now.strftime('%A, %H:%M')}"""
+        
+        await self.send(main_msg)
+        
+        # CONDITIONAL ALERTS
         messages = []
         
         # Monthly reminder (Day 1 or 25, 9am AEST = 23:00 UTC)
@@ -166,9 +216,9 @@ class DHHFBot:
 💰 Price: `${price:.2f}` (Score: {score}/100)
 {urgency}
 
-💡 *Action:* {action}
+💡 Action: {action}
 
-📊 *Context:*
+📊 Context:
 • 52w: ${data['low_52w']:.2f} - ${data['high_52w']:.2f}
 • From high: `{((data['high_52w']-price)/data['high_52w']*100):.1f}%` discount
 • Your avg: ${AVG_COST:.2f} (`{your_disc:+.1f}%`)
@@ -176,7 +226,7 @@ class DHHFBot:
                 messages.append(msg)
                 self.state['last_monthly'] = now.isoformat()
         
-        # Buy opportunity alert
+        # Buy opportunity alert (score >= 60)
         if should_buy and score >= 60:
             can_alert = True
             if self.state['last_alert']:
@@ -186,45 +236,33 @@ class DHHFBot:
             
             if can_alert:
                 sig_text = "\n".join([f"• {s}" for s in signals[:3]])
-                msg = f"""🎯 *BUY OPPORTUNITY*
+                msg = f"""🎯 *BUY OPPORTUNITY ALERT*
 
 {urgency} | Score: {score}/100
 
 💰 Price: `${price:.2f}` ({data['change']:+.1f}% today)
 📊 {percentile:.0f}th percentile
 
-✅ *Signals:*
+✅ Signals:
 {sig_text}
 
 💼 Your cost: ${AVG_COST:.2f} ({your_disc:+.1f}%)
 
-💡 *Do this:* {action}"""
+💡 Do this: {action}"""
                 messages.append(msg)
                 self.state['last_alert'] = now.isoformat()
                 self.state['dip_count'] += 1
         
-        # Daily summary (9am AEST = 23:00 UTC)
-        if now.hour == 23:
-            pnl = (price - AVG_COST) / AVG_COST * 100
-            emoji = "📈" if pnl >= 0 else "📉"
-            
-            msg = f"""📊 *DAILY SUMMARY - {now.strftime('%A, %B %d')}*
-
-💰 ${price:.2f} ({data['change']:+.1f}%) | Score: {score}/100
-{urgency}
-
-📈 52w: ${data['low_52w']:.2f}-${data['high_52w']:.2f} | {percentile:.0f}th %ile
-💼 Your avg: ${AVG_COST:.2f} | {emoji} P&L: `{pnl:+.1f}%`
-
-📅 Monthly: {self.state['monthly_count']} | 🎯 Dips: {self.state['dip_count']}"""
-            messages.append(msg)
-        
+        # Send additional messages
         for msg in messages:
             await self.send(msg)
             await asyncio.sleep(1)
         
+        # Save state
         self.state['last_price'] = price
         self.save()
+        
+        logger.info(f"Bot run complete. Sent {2 + len(messages)} messages.")
 
 
 if __name__ == '__main__':
