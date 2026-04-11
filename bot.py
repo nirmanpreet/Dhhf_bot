@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DHHF Ultimate Bot v3.1 - TEST MODE (always sends message)"""
+"""DHHF Ultimate Bot v3.2 - FIXED with cost update reminder"""
 
 import os
 import json
@@ -48,7 +48,21 @@ class DHHFBot:
             ticker = yf.Ticker("DHHF.AX")
             info = ticker.info
             current = info.get('regularMarketPrice') or info.get('navPrice')
-            change = info.get('regularMarketChangePercent', 0) * 100
+            
+            # FIX: Yahoo returns decimal (0.05 = 5%), convert properly
+            change_raw = info.get('regularMarketChangePercent', 0)
+            if change_raw and abs(change_raw) < 0.5:
+                change = change_raw * 100
+            else:
+                change = change_raw
+            
+            # Verify with calculated change
+            prev_close = info.get('previousClose')
+            if prev_close and current and prev_close > 0:
+                calc_change = ((current - prev_close) / prev_close) * 100
+                if abs(change) > 10 and abs(calc_change) < 10:
+                    change = calc_change
+            
             hist = ticker.history(period="1y")
             return {
                 'price': current, 'change': change,
@@ -66,7 +80,7 @@ class DHHFBot:
         score = 0
         signals = []
         
-        # 1. Historical percentile (30%)
+        # Historical percentile (30%)
         percentile = (hist <= price).mean() * 100
         if percentile <= 10:
             score += 30
@@ -78,7 +92,7 @@ class DHHFBot:
             score += 18
             signals.append("👍 30th percentile - good value")
         
-        # 2. 52-week high distance (25%)
+        # 52-week high distance (25%)
         discount = (data['high_52w'] - price) / data['high_52w'] * 100
         if discount >= 15:
             score += 25
@@ -90,7 +104,7 @@ class DHHFBot:
             score += 12
             signals.append(f"📉 {discount:.1f}% below 52w high")
         
-        # 3. vs Your cost (20%)
+        # vs Your cost (20%)
         your_discount = (AVG_COST - price) / AVG_COST * 100
         if your_discount >= 5:
             score += 20
@@ -99,7 +113,7 @@ class DHHFBot:
             score += 15
             signals.append(f"✅ {your_discount:.1f}% below your cost")
         
-        # 4. Moving averages (15%)
+        # Moving averages (15%)
         if price < data['avg_200d'] and price < data['avg_50d']:
             score += 15
             signals.append("📈 Below 50d & 200d MA")
@@ -107,7 +121,7 @@ class DHHFBot:
             score += 10
             signals.append("📊 Below 50d MA")
         
-        # 5. Daily momentum (10%)
+        # Daily momentum (10%)
         if data['change'] <= -3:
             score += 10
             signals.append(f"🔻 Big drop {data['change']:.1f}%")
@@ -130,22 +144,19 @@ class DHHFBot:
             return "⏳ WEAK", False, "Don't buy - too expensive"
     
     async def send(self, msg):
-        """Send Telegram message with error logging"""
         try:
             bot = Bot(token=TOKEN)
             await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
-            logger.info(f"✅ Message sent successfully to {CHAT_ID}")
+            logger.info(f"✅ Message sent to {CHAT_ID}")
             return True
         except Exception as e:
-            logger.error(f"❌ Telegram send failed: {e}")
-            logger.error(f"Token: {TOKEN[:10]}... Chat ID: {CHAT_ID}")
+            logger.error(f"❌ Telegram error: {e}")
             return False
     
     async def run(self):
-        """Main bot logic - ALWAYS sends test message first"""
-        
-        # TEST MESSAGE (always sent)
         now = datetime.now()
+        
+        # TEST MESSAGE
         test_msg = f"""🧪 *BOT TEST MESSAGE*
 
 If you see this, your bot is working! ✅
@@ -155,31 +166,30 @@ Chat ID: {CHAT_ID}
 
 Now fetching DHHF data..."""
         
-        test_sent = await self.send(test_msg)
-        if not test_sent:
-            logger.error("❌ Failed to send test message - check your Telegram token and chat ID")
+        if not await self.send(test_msg):
+            logger.error("Failed to send test message")
             return
         
         await asyncio.sleep(2)
         
         # FETCH DATA
         data = self.fetch_data()
-        
         if not data or not data['price']:
-            error_msg = "❌ *ERROR*\n\nFailed to fetch DHHF data. Will retry in 15 minutes."
-            await self.send(error_msg)
+            await self.send("❌ Error fetching DHHF data")
             return
         
         price = data['price']
+        change = data['change']
+        
+        logger.info(f"Price: ${price:.2f}, Change: {change:.2f}%")
+        
         score, percentile, signals, your_disc = self.calculate_score(price, data)
         urgency, should_buy, action = self.get_urgency(score)
         
-        logger.info(f"Price: ${price:.2f} | Score: {score}/100")
-        
-        # MAIN ANALYSIS MESSAGE (always sent)
+        # MAIN MESSAGE
         main_msg = f"""📊 *DHHF ANALYSIS*
 
-💰 Price: `${price:.2f}` ({data['change']:+.1f}% today)
+💰 Price: `${price:.2f}` ({change:+.2f}% today)
 🎯 Score: {score}/100 - {urgency}
 
 📈 Market Context:
@@ -199,70 +209,27 @@ Now fetching DHHF data..."""
         
         await self.send(main_msg)
         
-        # CONDITIONAL ALERTS
-        messages = []
-        
-        # Monthly reminder (Day 1 or 25, 9am AEST = 23:00 UTC)
-        if (now.day == 1 or now.day == 25) and now.hour == 23:
-            can_remind = True
-            if self.state['last_monthly']:
-                last = datetime.fromisoformat(self.state['last_monthly'])
-                if last.month == now.month:
-                    can_remind = False
+        # COST UPDATE REMINDER (if price is significantly different)
+        if abs(your_disc) > 5:
+            update_msg = f"""💡 *Cost Update Tip*
+
+Your avg cost (${AVG_COST:.2f}) is very different from current price (${price:.2f}).
+
+To update your average cost:
+1. Go to GitHub → Settings → Secrets
+2. Update AVERAGE_COST to your new average
+3. Re-run workflow
+
+*New avg formula:*
+(Old Shares × Old Avg + New $) / (Old Shares + New Shares)"""
             
-            if can_remind:
-                msg = f"""📅 *MONTHLY DCA DAY - {now.strftime('%B %d')}*
-
-💰 Price: `${price:.2f}` (Score: {score}/100)
-{urgency}
-
-💡 Action: {action}
-
-📊 Context:
-• 52w: ${data['low_52w']:.2f} - ${data['high_52w']:.2f}
-• From high: `{((data['high_52w']-price)/data['high_52w']*100):.1f}%` discount
-• Your avg: ${AVG_COST:.2f} (`{your_disc:+.1f}%`)
-• Historical: {percentile:.0f}th percentile"""
-                messages.append(msg)
-                self.state['last_monthly'] = now.isoformat()
-        
-        # Buy opportunity alert (score >= 60)
-        if should_buy and score >= 60:
-            can_alert = True
-            if self.state['last_alert']:
-                last = datetime.fromisoformat(self.state['last_alert'])
-                if (now - last).days < 1:
-                    can_alert = False
-            
-            if can_alert:
-                sig_text = "\n".join([f"• {s}" for s in signals[:3]])
-                msg = f"""🎯 *BUY OPPORTUNITY ALERT*
-
-{urgency} | Score: {score}/100
-
-💰 Price: `${price:.2f}` ({data['change']:+.1f}% today)
-📊 {percentile:.0f}th percentile
-
-✅ Signals:
-{sig_text}
-
-💼 Your cost: ${AVG_COST:.2f} ({your_disc:+.1f}%)
-
-💡 Do this: {action}"""
-                messages.append(msg)
-                self.state['last_alert'] = now.isoformat()
-                self.state['dip_count'] += 1
-        
-        # Send additional messages
-        for msg in messages:
-            await self.send(msg)
-            await asyncio.sleep(1)
+            await self.send(update_msg)
         
         # Save state
         self.state['last_price'] = price
         self.save()
         
-        logger.info(f"Bot run complete. Sent {2 + len(messages)} messages.")
+        logger.info("Bot run complete")
 
 
 if __name__ == '__main__':
