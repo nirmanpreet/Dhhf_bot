@@ -1,288 +1,234 @@
 #!/usr/bin/env python3
-"""DHHF Ultimate Bot v3.3 - Production Ready"""
 
 import os
 import json
 import logging
-from datetime import datetime
+import hashlib
 import asyncio
+from datetime import datetime, timedelta
+import pytz
+
 import yfinance as yf
-import pandas as pd
-import numpy as np
 from telegram import Bot
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Config from GitHub Secrets
+# ================= CONFIG ================= #
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-AVG_COST = float(os.getenv('AVERAGE_COST', '38.50'))
+
+AVG_COST = float(os.getenv('AVERAGE_COST', '38.5'))
 MONTHLY = float(os.getenv('MONTHLY_AMOUNT', '1000'))
 BONUS = float(os.getenv('BONUS_AMOUNT', '1000'))
+MONTHLY_BUDGET = float(os.getenv('MONTHLY_BUDGET', '3000'))
 
 STATE_FILE = 'bot_state.json'
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+TZ = pytz.timezone('Australia/Melbourne')
+
+
+# ================= BOT ================= #
 class DHHFBot:
+
     def __init__(self):
         self.state = self.load_state()
-    
+
+    # ---------- STATE ----------
     def load_state(self):
         defaults = {
-            'avg_cost': AVG_COST,
-            'total_invested': 0,
-            'monthly_count': 0,
-            'dip_count': 0,
-            'last_monthly': None,
-            'last_alert': None,
-            'last_price': None
+            "last_price": None,
+            "last_alert": None,
+            "last_msg_hash": None,
+            "monthly_spent": 0,
+            "current_month": None
         }
+
         if os.path.exists(STATE_FILE):
             try:
-                with open(STATE_FILE, 'r') as f:
+                with open(STATE_FILE, "r") as f:
                     defaults.update(json.load(f))
             except:
                 pass
+
         return defaults
-    
+
     def save(self):
-        with open(STATE_FILE, 'w') as f:
+        with open(STATE_FILE, "w") as f:
             json.dump(self.state, f, indent=2)
-    
+
+    def reset_month(self, now):
+        if self.state["current_month"] != now.month:
+            self.state["monthly_spent"] = 0
+            self.state["current_month"] = now.month
+
+    # ---------- ASX HOURS ----------
+    def is_asx_open(self, now):
+        if now.weekday() >= 5:
+            return False
+
+        open_time = now.replace(hour=10, minute=0, second=0, microsecond=0)
+        close_time = now.replace(hour=16, minute=10, second=0, microsecond=0)
+
+        return open_time <= now <= close_time
+
+    # ---------- DATA ----------
     def fetch_data(self):
-        try:
-            ticker = yf.Ticker("DHHF.AX")
-            info = ticker.info
-            
-            current = info.get('regularMarketPrice') or info.get('navPrice')
-            if not current:
-                logger.error("No price data available")
-                return None
-            
-            # Fix percentage calculation
-            change_raw = info.get('regularMarketChangePercent', 0)
-            if change_raw and abs(change_raw) < 0.5:
-                change = change_raw * 100
-            else:
-                change = change_raw
-            
-            # Double-check with calculated value
-            prev_close = info.get('previousClose')
-            if prev_close and current and prev_close > 0:
-                calc_change = ((current - prev_close) / prev_close) * 100
-                if abs(change) > 10 and abs(calc_change) < 10:
-                    change = calc_change
-            
-            hist = ticker.history(period="1y")
-            if hist.empty:
-                logger.error("No historical data")
-                return None
-            
-            return {
-                'price': current,
-                'change': change,
-                'high_52w': hist['Close'].max(),
-                'low_52w': hist['Close'].min(),
-                'avg_50d': hist['Close'].rolling(50).mean().iloc[-1],
-                'avg_200d': hist['Close'].rolling(200).mean().iloc[-1],
-                'hist': hist['Close']
-            }
-        except Exception as e:
-            logger.error(f"Data fetch error: {e}")
+        ticker = yf.Ticker("DHHF.AX")
+
+        intraday = ticker.history(period="1d", interval="1m")
+        hist = ticker.history(period="1y")
+
+        if intraday.empty or hist.empty:
             return None
-    
-    def calculate_score(self, price, data):
-        hist = data['hist']
+
+        price = intraday["Close"].iloc[-1]
+        prev_close = ticker.history(period="2d")["Close"].iloc[-2]
+        change = ((price - prev_close) / prev_close) * 100
+
+        return {
+            "price": price,
+            "change": change,
+            "hist": hist["Close"],
+            "high_52w": hist["Close"].max(),
+            "avg_200d": hist["Close"].rolling(200).mean().iloc[-1],
+        }
+
+    # ---------- SCORE ----------
+    def calculate_score(self, data):
+        price = data["price"]
+        hist = data["hist"]
+
         score = 0
         signals = []
-        
-        # 1. Historical percentile (30%)
+
         percentile = (hist <= price).mean() * 100
-        if percentile <= 10:
+        if percentile < 20:
             score += 30
-            signals.append("🔥 10th percentile - rare discount!")
-        elif percentile <= 20:
-            score += 24
-            signals.append("✅ 20th percentile - great entry")
-        elif percentile <= 30:
-            score += 18
-            signals.append("👍 30th percentile - good value")
-        
-        # 2. 52-week high distance (25%)
-        discount = (data['high_52w'] - price) / data['high_52w'] * 100
-        if discount >= 15:
+            signals.append("Value zone")
+
+        discount = (data["high_52w"] - price) / data["high_52w"] * 100
+        if discount > 15:
             score += 25
-            signals.append(f"🔥 {discount:.1f}% below 52w high")
-        elif discount >= 10:
+            signals.append("Below 52W high")
+
+        if discount > 25:
             score += 20
-            signals.append(f"✅ {discount:.1f}% below 52w high")
-        elif discount >= 5:
-            score += 12
-            signals.append(f"📉 {discount:.1f}% below 52w high")
-        
-        # 3. vs Your cost (20%)
-        your_discount = (AVG_COST - price) / AVG_COST * 100
-        if your_discount >= 5:
-            score += 20
-            signals.append(f"🎯 {your_discount:.1f}% below YOUR cost!")
-        elif your_discount >= 2:
-            score += 15
-            signals.append(f"✅ {your_discount:.1f}% below your cost")
-        
-        # 4. Moving averages (15%)
-        if price < data['avg_200d'] and price < data['avg_50d']:
-            score += 15
-            signals.append("📈 Below 50d & 200d MA")
-        elif price < data['avg_50d']:
+            signals.append("Crash zone")
+
+        if price < data["avg_200d"]:
             score += 10
-            signals.append("📊 Below 50d MA")
-        
-        # 5. Daily momentum (10%)
-        if data['change'] <= -3:
-            score += 10
-            signals.append(f"🔻 Big drop {data['change']:.1f}%")
-        elif data['change'] <= -1.5:
-            score += 6
-            signals.append(f"📉 Down {data['change']:.1f}%")
-        
-        return score, percentile, signals, your_discount
-    
-    def get_urgency(self, score):
-        if score >= 75:
-            return "🔥 URGENT", True, f"BUY NOW - ${MONTHLY:.0f} + ${BONUS:.0f} bonus!"
-        elif score >= 60:
-            return "✅ STRONG", True, f"Good time - ${MONTHLY:.0f} + ${BONUS/2:.0f} extra"
-        elif score >= 45:
-            return "👍 MODERATE", True, f"Fair - ${MONTHLY:.0f} regular"
-        elif score >= 30:
-            return "⚖️ NEUTRAL", False, "Wait for better"
+            signals.append("Bear market")
+
+        return score, percentile, discount, signals
+
+    # ---------- ALLOCATION ----------
+    def get_allocation(self, score):
+        dca = MONTHLY
+        extra = 0
+
+        if score < 60:
+            extra = 0
+        elif score < 75:
+            extra = BONUS * 0.5
+        elif score < 85:
+            extra = BONUS
         else:
-            return "⏳ WEAK", False, "Don't buy - too expensive"
-    
+            extra = BONUS * 2
+
+        return dca, extra
+
+    # ---------- BUDGET ----------
+    def apply_budget(self, dca, extra):
+        remaining = MONTHLY_BUDGET - self.state["monthly_spent"]
+
+        if remaining <= 0:
+            return 0, 0, 0
+
+        if dca > remaining:
+            return remaining, 0, remaining
+
+        total = dca + extra
+
+        if total > remaining:
+            extra = remaining - dca
+
+        total = dca + extra
+        return dca, extra, total
+
+    # ---------- DUPLICATE ----------
+    def is_duplicate(self, msg):
+        h = hashlib.md5(msg.encode()).hexdigest()
+        if self.state.get("last_msg_hash") == h:
+            return True
+        self.state["last_msg_hash"] = h
+        return False
+
+    # ---------- TELEGRAM ----------
     async def send(self, msg):
         try:
             bot = Bot(token=TOKEN)
-            await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
-            logger.info("Message sent successfully")
-            return True
+            await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+            await asyncio.sleep(2)
         except Exception as e:
-            logger.error(f"Failed to send message: {e}")
-            return False
-    
+            logger.error(e)
+
+    # ---------- MAIN ----------
     async def run(self):
-        now = datetime.now()
-        hour = now.hour
-        
-        # Fetch data
-        data = self.fetch_data()
-        if not data or not data['price']:
-            logger.error("Failed to fetch DHHF data")
+        now = datetime.now(TZ)
+
+        if not self.is_asx_open(now):
             return
-        
-        price = data['price']
-        change = data['change']
-        
-        logger.info(f"DHHF: ${price:.2f} ({change:+.2f}%)")
-        
-        score, percentile, signals, your_disc = self.calculate_score(price, data)
-        urgency, should_buy, action = self.get_urgency(score)
-        
-        messages = []
-        
-        # 1. DAILY SUMMARY (9am AEST = 23:00 UTC)
-        if hour == 23:
-            pnl = (price - AVG_COST) / AVG_COST * 100
-            emoji = "📈" if pnl >= 0 else "📉"
-            
-            msg = f"""📊 *DHHF DAILY SUMMARY - {now.strftime('%A, %B %d')}*
 
-💰 Price: `${price:.2f}` ({change:+.2f}% today)
-🎯 Score: {score}/100 - {urgency}
+        # reduce noise (optional)
+        if now.hour not in [10, 12, 14, 16]:
+            return
 
-📈 Market Context:
-• 52w Range: ${data['low_52w']:.2f} - ${data['high_52w']:.2f}
-• From High: `{((data['high_52w']-price)/data['high_52w']*100):.1f}%` discount
-• Historical: {percentile:.0f}th percentile
-• 50d MA: ${data['avg_50d']:.2f} | 200d MA: ${data['avg_200d']:.2f}
+        self.reset_month(now)
 
-💼 Your Position:
-• Avg Cost: ${AVG_COST:.2f}
-• vs Your Cost: `{your_disc:+.1f}%`
-• P&L: `{pnl:+.2f}%` {emoji}
+        data = self.fetch_data()
+        if not data:
+            return
 
-💡 {action}
+        score, percentile, discount, signals = self.calculate_score(data)
 
-📅 Monthly: {self.state['monthly_count']} | 🎯 Dips: {self.state['dip_count']}"""
-            
-            messages.append(msg)
-        
-        # 2. MONTHLY DCA REMINDER (Day 1 or 25, 9am AEST)
-        if (now.day == 1 or now.day == 25) and hour == 23:
-            can_remind = True
-            if self.state['last_monthly']:
-                last = datetime.fromisoformat(self.state['last_monthly'])
-                if last.month == now.month:
-                    can_remind = False
-            
-            if can_remind:
-                msg = f"""📅 *MONTHLY DCA DAY - {now.strftime('%B %d')}*
+        # cooldown protection
+        last = self.state.get("last_alert")
+        if last:
+            if (now - datetime.fromisoformat(last)) < timedelta(hours=4):
+                return
 
-💰 Price: `${price:.2f}` (Score: {score}/100)
-{urgency}
+        dca, extra = self.get_allocation(score)
+        dca, extra, total = self.apply_budget(dca, extra)
 
-💡 {action}
+        if score < 60 or total <= 0:
+            return
 
-📊 Context:
-• 52w: ${data['low_52w']:.2f} - ${data['high_52w']:.2f}
-• From high: `{((data['high_52w']-price)/data['high_52w']*100):.1f}%` discount
-• Your avg: ${AVG_COST:.2f} (`{your_disc:+.1f}%`)
-• Historical: {percentile:.0f}th percentile"""
-                
-                messages.append(msg)
-                self.state['last_monthly'] = now.isoformat()
-        
-        # 3. BUY OPPORTUNITY ALERT (Score >= 60)
-        if should_buy and score >= 60:
-            can_alert = True
-            if self.state['last_alert']:
-                last = datetime.fromisoformat(self.state['last_alert'])
-                if (now - last).days < 1:
-                    can_alert = False
-            
-            if can_alert:
-                sig_text = "\n".join([f"• {s}" for s in signals[:3]])
-                
-                msg = f"""🎯 *BUY OPPORTUNITY ALERT*
+        msg = f"""🎯 *DHHF BUY SIGNAL*
 
-{urgency} | Score: {score}/100
+Score: {score}
 
-💰 Price: `${price:.2f}` ({change:+.2f}% today)
-📊 {percentile:.0f}th percentile
+💰 Price: ${data['price']:.2f}
+📉 Percentile: {percentile:.0f}
+📉 Drawdown: {discount:.1f}%
 
-✅ Signals:
-{sig_text}
+💰 DCA: ${dca:.0f}
+🚀 Extra: ${extra:.0f}
+💵 Total: ${total:.0f}
 
-💼 Your cost: ${AVG_COST:.2f} ({your_disc:+.1f}%)
+📊 Budget Left: ${MONTHLY_BUDGET - self.state['monthly_spent']:.0f}
+"""
 
-💡 {action}"""
-                
-                messages.append(msg)
-                self.state['last_alert'] = now.isoformat()
-                self.state['dip_count'] += 1
-        
-        # Send all messages
-        for msg in messages:
+        if not self.is_duplicate(msg):
             await self.send(msg)
-            await asyncio.sleep(1)
-        
-        # Save state
-        self.state['last_price'] = price
+
+            self.state["monthly_spent"] += total
+            self.state["last_alert"] = now.isoformat()
+
+        self.state["last_price"] = data["price"]
         self.save()
-        
-        logger.info(f"Sent {len(messages)} messages")
 
 
-if __name__ == '__main__':
-    bot = DHHFBot()
-    asyncio.run(bot.run())
+# ================= RUN ================= #
+if __name__ == "__main__":
+    asyncio.run(DHHFBot().run())
