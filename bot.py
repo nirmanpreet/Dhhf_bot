@@ -232,3 +232,4 @@ Score: {score}
 # ================= RUN ================= #
 if __name__ == "__main__":
     asyncio.run(DHHFBot().run())
+    print("completed")
