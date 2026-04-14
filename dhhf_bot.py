@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-
+"""DHHF Bot v9 - Full Featured DCA Engine with Verbose Logging"""
 
 import os
 import json
 import logging
 import hashlib
 import asyncio
+import time
 from datetime import datetime, timedelta
 import pytz
 import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import yfinance as yf
 from telegram import Bot
 
@@ -123,56 +127,150 @@ class DHHFBot:
         return min_s
 
     # ---------- DATA ----------
+    def _make_session(self):
+        """
+        Build a requests.Session that looks like a browser.
+        GitHub Actions IPs are heavily rate-limited by Yahoo Finance because
+        thousands of bots run from the same shared IP ranges. A browser-like
+        User-Agent + retry adapter works around the most common 429 blocks.
+        """
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-AU,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT":             "1",
+        })
+        # Auto-retry on 429 / 5xx with exponential backoff
+        retry = Retry(
+            total=4,
+            backoff_factor=2,          # waits 2s, 4s, 8s, 16s
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://",  adapter)
+        return session
+
+    def _fetch_yahoo_direct(self):
+        """
+        Fallback: hit the Yahoo Finance v8 chart API directly.
+        Returns a pd.Series of daily closes (1Y) or None on failure.
+        This bypasses yfinance entirely, which helps when yfinance's
+        cookie/crumb logic gets tripped up by rate limits.
+        """
+        url = (
+            "https://query1.finance.yahoo.com/v8/finance/chart/DHHF.AX"
+            "?interval=1d&range=1y&includePrePost=false"
+        )
+        try:
+            logger.info("   Trying direct Yahoo Finance v8 API...")
+            r = self._make_session().get(url, timeout=15)
+            r.raise_for_status()
+            data  = r.json()
+            chart = data["chart"]["result"][0]
+            ts    = chart["timestamp"]
+            closes = chart["indicators"]["quote"][0]["close"]
+            closes = [c for c in closes if c is not None]
+            if not closes:
+                logger.error("   ❌ Direct API returned empty closes")
+                return None
+            idx    = pd.to_datetime(ts[:len(closes)], unit="s", utc=True)
+            series = pd.Series(closes, index=idx, dtype=float)
+            logger.info(f"   ✅ Direct API returned {len(series)} daily closes")
+            return series
+        except Exception as e:
+            logger.error(f"   ❌ Direct API fallback failed: {e}")
+            return None
+
     def fetch_data(self):
         sep("MARKET DATA")
-        try:
-            logger.info("📡 Fetching DHHF.AX from yfinance...")
-            ticker   = yf.Ticker("DHHF.AX")
-            intraday = ticker.history(period="1d", interval="1m")
-            hist     = ticker.history(period="1y")
+        #
+        # WHY NO INTRADAY:
+        #   period="1d", interval="1m" is the most fragile yfinance call.
+        #   Yahoo Finance blocks it first from server IPs (GitHub Actions,
+        #   PythonAnywhere, etc.) and it returns empty even during market
+        #   hours for ASX stocks. Daily data is sufficient for a DCA bot —
+        #   we only need the latest close, not tick-level data.
+        #
+        # STRATEGY:
+        #   Attempt 1 — yfinance with a browser-like session (handles most
+        #               429 blocks from GitHub Actions)
+        #   Attempt 2 — direct Yahoo Finance v8 API (bypasses yfinance's
+        #               cookie/crumb logic entirely)
+        #   Both use the same daily 1Y period.
+        #
+        hist = None
 
-            if intraday.empty:
-                logger.error("❌ Intraday data is empty — yfinance may be rate-limited or ticker invalid")
-                return None
-            if hist.empty:
-                logger.error("❌ Historical (1Y) data is empty")
-                return None
+        # ── Attempt 1: yfinance with browser session ──
+        for attempt in range(1, 4):
+            try:
+                logger.info(f"📡 yfinance attempt {attempt}/3 (DHHF.AX, 1Y daily)...")
+                session = self._make_session()
+                ticker  = yf.Ticker("DHHF.AX", session=session)
+                df      = ticker.history(period="1y", interval="1d", auto_adjust=True)
+                if not df.empty and len(df) > 5:
+                    hist = df["Close"]
+                    logger.info(f"   ✅ yfinance returned {len(hist)} daily closes (attempt {attempt})")
+                    break
+                else:
+                    logger.warning(f"   ⚠️  Attempt {attempt}: got {len(df)} rows — too few, retrying...")
+                    time.sleep(3 * attempt)
+            except Exception as e:
+                logger.warning(f"   ⚠️  Attempt {attempt} exception: {e}")
+                time.sleep(3 * attempt)
 
-            price      = float(intraday["Close"].iloc[-1])
-            prev_close = float(hist["Close"].iloc[-2])
-            change     = ((price - prev_close) / prev_close) * 100
-            direction  = "📈" if change >= 0 else "📉"
+        # ── Attempt 2: direct Yahoo v8 API ──
+        if hist is None:
+            logger.info("📡 yfinance exhausted — trying direct Yahoo Finance API...")
+            hist = self._fetch_yahoo_direct()
 
-            logger.info(f"   Intraday rows  : {len(intraday)} 1-min candles")
-            logger.info(f"   Last price     : ${price:.2f}")
-            logger.info(f"   Prev close     : ${prev_close:.2f}")
-            logger.info(f"   Day change     : {direction} {change:+.2f}%")
-            logger.info(f"   1Y data rows   : {len(hist)} trading days")
-
-            high_52w = float(hist["Close"].max())
-            low_52w  = float(hist["Close"].min())
-            logger.info(f"   52W High       : ${high_52w:.2f}")
-            logger.info(f"   52W Low        : ${low_52w:.2f}")
-
-            ma_200 = hist["Close"].rolling(200).mean().iloc[-1]
-            if pd.isna(ma_200):
-                ma_200 = hist["Close"].mean()
-                logger.warning(f"   ⚠️  200d MA NaN (only {len(hist)} days available) — using {len(hist)}-day mean: ${ma_200:.2f}")
-            else:
-                logger.info(f"   200d MA        : ${ma_200:.2f}")
-
-            return {
-                "price":    price,
-                "change":   change,
-                "hist":     hist["Close"],
-                "high_52w": high_52w,
-                "low_52w":  low_52w,
-                "avg_200d": float(ma_200),
-            }
-
-        except Exception as e:
-            logger.error(f"❌ Data fetch exception: {e}")
+        if hist is None or len(hist) < 5:
+            logger.error("❌ All data sources failed — cannot proceed")
+            logger.error("   Possible causes:")
+            logger.error("   • GitHub Actions IP is rate-limited by Yahoo Finance (most common)")
+            logger.error("   • ASX is closed and Yahoo returned no data for today")
+            logger.error("   • Yahoo Finance endpoint changed (check yfinance GitHub issues)")
+            logger.error("   • Network egress blocked from this runner")
             return None
+
+        # ── Parse ──
+        price      = float(hist.iloc[-1])
+        prev_close = float(hist.iloc[-2])
+        change     = ((price - prev_close) / prev_close) * 100
+        direction  = "📈" if change >= 0 else "📉"
+
+        logger.info(f"   Last close     : ${price:.2f}")
+        logger.info(f"   Prev close     : ${prev_close:.2f}")
+        logger.info(f"   Day change     : {direction} {change:+.2f}%")
+        logger.info(f"   Data points    : {len(hist)} trading days")
+
+        high_52w = float(hist.max())
+        low_52w  = float(hist.min())
+        logger.info(f"   52W High       : ${high_52w:.2f}")
+        logger.info(f"   52W Low        : ${low_52w:.2f}")
+
+        ma_200 = hist.rolling(200).mean().iloc[-1]
+        if pd.isna(ma_200):
+            ma_200 = hist.mean()
+            logger.warning(f"   ⚠️  200d MA NaN ({len(hist)} days) — using period mean: ${ma_200:.2f}")
+        else:
+            logger.info(f"   200d MA        : ${ma_200:.2f}")
+
+        return {
+            "price":    price,
+            "change":   change,
+            "hist":     hist,
+            "high_52w": high_52w,
+            "low_52w":  low_52w,
+            "avg_200d": float(ma_200),
+        }
 
     # ---------- RSI ----------
     def calculate_rsi(self, closes, period=14):
