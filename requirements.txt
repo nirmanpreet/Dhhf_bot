@@ -1,4 +1,6 @@
-yfinance>=0.2.36
+yfinance>=0.2.61
 python-telegram-bot>=20.0
 pytz
 pandas
+requests
+urllib3
