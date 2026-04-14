@@ -208,13 +208,13 @@ class DHHFBot:
         #
         hist = None
 
-        # ── Attempt 1: yfinance with browser session ──
+        # ── Attempt 1: yfinance (no custom session — v1.2+ uses curl_cffi internally
+        #    and rejects a plain requests.Session with an explicit error)
         for attempt in range(1, 4):
             try:
                 logger.info(f"📡 yfinance attempt {attempt}/3 (DHHF.AX, 1Y daily)...")
-                session = self._make_session()
-                ticker  = yf.Ticker("DHHF.AX", session=session)
-                df      = ticker.history(period="1y", interval="1d", auto_adjust=True)
+                ticker = yf.Ticker("DHHF.AX")
+                df     = ticker.history(period="1y", interval="1d", auto_adjust=True)
                 if not df.empty and len(df) > 5:
                     hist = df["Close"]
                     logger.info(f"   ✅ yfinance returned {len(hist)} daily closes (attempt {attempt})")
